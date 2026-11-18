@@ -141,6 +141,111 @@ class KeywordSimilarity(BaseEstimator, TransformerMixin):
         return np.array(self.feature_names_out_, dtype=object)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# spaCy word vectors (the method from the "Text Processing" class notebook)
+# ---------------------------------------------------------------------------------------------------------------------
+# The keyword method above only fires when a note shares a word stem with a keyword. spaCy's `en_core_web_lg` model gives
+# every English word a 300-number vector, and words with similar meanings get similar vectors. A note's vector is the
+# average of its word vectors, so "very hostile, lunged at my dog" can be close to "aggressive attacking and biting"
+# without sharing a single word.
+
+SPACY_MODEL = "en_core_web_lg"
+
+# Short descriptions of the same four symptom themes as KEYWORDS (from the Frame step, not from the label).
+# The word "squirrel" is left out on purpose: it is in many notes and would make every note look a little similar.
+CONCEPTS = {
+    "aggression": ["aggressive attacking and biting", "angry hostile charging at people"],
+    "foaming":    ["foaming at the mouth", "drooling saliva"],
+    "fur":        ["mangy fur with bald patches", "scabs wounds and injured skin"],
+    "ill":        ["sick weak and lethargic", "stumbling confused erratic movement"],
+}
+
+_NLP = None             # the spaCy model, loaded once per Python process (only when a spaCy feature is used)
+_VECTOR_CACHE = {}      # text -> vector, so cross-validation does not embed the same note again and again
+
+
+def get_nlp():
+    """Load the spaCy model once. Only the tokenizer and the word vectors are needed, so the other parts are skipped."""
+    global _NLP
+    if _NLP is None:
+        import spacy
+        _NLP = spacy.load(SPACY_MODEL, exclude=["tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer",
+                                                "ner", "senter"])
+    return _NLP
+
+
+def texts_to_vectors(texts, exclude_stop=True, exclude_punct=True):
+    """Embed each text as the average of its word vectors (as in the class notebook). Empty text -> a vector of zeros.
+
+    exclude_stop   leave out very common words ('the', 'and', 'at'). They pull every average towards the same
+                   "plain English" direction, which matters for short notes like ours
+    exclude_punct  leave out punctuation
+    """
+    texts = pd.Series(texts).astype("string").fillna("").tolist()
+    key = (exclude_stop, exclude_punct)
+    todo = list(dict.fromkeys(t for t in texts if (t, key) not in _VECTOR_CACHE))
+    if todo:
+        nlp = get_nlp()
+        size = nlp.vocab.vectors_length
+        for text, doc in zip(todo, nlp.pipe(todo)):
+            tokens = [t.vector for t in doc if t.has_vector and not t.is_space
+                      and not (exclude_stop and t.is_stop) and not (exclude_punct and t.is_punct)]
+            _VECTOR_CACHE[(text, key)] = (np.mean(tokens, axis=0) if tokens else np.zeros(size)).astype(np.float32)
+    return np.vstack([_VECTOR_CACHE[(t, key)] for t in texts]) if texts else np.zeros((0, 300), np.float32)
+
+
+def _unit(rows):
+    """Scale each row to length 1, so a dot product is the cosine similarity. Rows of zeros stay zeros."""
+    norms = np.linalg.norm(rows, axis=1, keepdims=True)
+    return np.divide(rows, norms, out=np.zeros_like(rows), where=norms > 0)
+
+
+class SpacyConceptSimilarity(BaseEstimator, TransformerMixin):
+    """How close is each note to each symptom theme, in meaning? (cosine similarity of spaCy vectors)
+
+    1. The note is cleaned like in KeywordSimilarity (lower case, census boilerplate removed).
+    2. The note and every concept phrase become spaCy document vectors (average word vector, stop words left out).
+    3. The cosine similarity between the note and each phrase of a theme is computed, and the **largest** one is kept.
+       Values are between -1 and 1 (in practice 0 to about 0.8). An empty note gives 0.
+
+    Nothing is learned from the data: `fit` only embeds the concept phrases. So there is no way for the label to leak in.
+    Columns: sem_<theme> for each theme, sem_any (largest over all phrases) and has_note (0/1).
+    """
+
+    def __init__(self, concepts=None, exclude_stop=True):
+        self.concepts = concepts
+        self.exclude_stop = exclude_stop
+
+    def fit(self, notes, y=None):
+        concepts = CONCEPTS if self.concepts is None else self.concepts
+        self.themes_ = list(concepts)
+        self.phrases_ = [p for theme in self.themes_ for p in concepts[theme]]
+        self.phrase_theme_ = np.array([i for i, theme in enumerate(self.themes_) for _ in concepts[theme]])
+        self.concept_vectors_ = _unit(texts_to_vectors(self.phrases_, exclude_stop=self.exclude_stop))
+        self.feature_names_out_ = [f"sem_{t}" for t in self.themes_] + ["sem_any", "has_note"]
+        return self
+
+    def similarities(self, notes):
+        """Cosine similarity of every note with every concept phrase (a table notes x phrases)."""
+        check_is_fitted(self, "concept_vectors_")
+        notes = KeywordSimilarity.clean(notes)
+        sims = _unit(texts_to_vectors(notes, exclude_stop=self.exclude_stop)) @ self.concept_vectors_.T
+        return pd.DataFrame(sims, index=notes.index, columns=self.phrases_)
+
+    def transform(self, notes):
+        sims = self.similarities(notes).to_numpy()
+        notes = KeywordSimilarity.clean(notes)
+        sims = sims.astype(float)
+        out = {f"sem_{theme}": sims[:, self.phrase_theme_ == i].max(axis=1) for i, theme in enumerate(self.themes_)}
+        out["sem_any"] = sims.max(axis=1)
+        out["has_note"] = (notes != "").astype("int8").to_numpy()
+        return pd.DataFrame(out, index=notes.index)
+
+    def get_feature_names_out(self, input_features=None):
+        check_is_fitted(self, "feature_names_out_")
+        return np.array(self.feature_names_out_, dtype=object)
+
+
 class SquirrelFeatures(BaseEstimator, TransformerMixin):
     """Cleans the raw sightings and builds the feature table (numbers, categories and 0/1 columns).
 
@@ -157,11 +262,14 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
       min_highlight_count    a highlight color needs at least this many training rows to get a column
       use_keyword_similarity add columns with the cosine similarity between the notes and the symptom keywords
                              (see KeywordSimilarity). Needs the TEXT_COLUMNS. Off by default
+      use_spacy_similarity   add columns with the cosine similarity between the spaCy vectors of the notes and the
+                             symptom concepts (see SpacyConceptSimilarity). Needs the TEXT_COLUMNS and spaCy's
+                             en_core_web_lg model. Off by default
     """
 
     def __init__(self, keep_day_level=False, drop_hill_distance=True, log_height=True, log_distances=False,
                  use_nearest_place_kind=True, use_highlight_colors=True, min_highlight_count=10,
-                 use_keyword_similarity=False):
+                 use_keyword_similarity=False, use_spacy_similarity=False):
         self.keep_day_level = keep_day_level
         self.drop_hill_distance = drop_hill_distance
         self.log_height = log_height
@@ -170,6 +278,7 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
         self.use_highlight_colors = use_highlight_colors
         self.min_highlight_count = min_highlight_count
         self.use_keyword_similarity = use_keyword_similarity
+        self.use_spacy_similarity = use_spacy_similarity
 
     # ---------- helpers ----------
     @staticmethod
@@ -184,7 +293,7 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
             needed.append("geo_nearest_place_kind")
         if self.keep_day_level:
             needed += DAY_LEVEL_NUMERIC + DAY_LEVEL_BINARY
-        if self.use_keyword_similarity:
+        if self.use_keyword_similarity or self.use_spacy_similarity:
             needed += TEXT_COLUMNS
         return needed
 
@@ -238,6 +347,10 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
         if self.use_keyword_similarity:
             out.update(self.keyword_.transform(self._notes(X)).to_dict("series"))
 
+        # --- spaCy similarity of the notes (optional): cosine similarities, left unscaled ---
+        if self.use_spacy_similarity:
+            out.update(self.spacy_.transform(self._notes(X)).to_dict("series"))
+
         # --- categories: unknown values get their own category instead of being dropped ---
         age = X["Age"].astype("string").str.strip()
         age = age.where(age.notna() & (age != "?"), "Unknown")                  # '?' and missing both mean unknown
@@ -272,6 +385,8 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
             raise KeyError(f"These columns are missing from the table: {absent}")
         if self.use_keyword_similarity:
             self.keyword_ = KeywordSimilarity().fit(self._notes(X))           # IDF weights from the training notes only
+        if self.use_spacy_similarity:
+            self.spacy_ = SpacyConceptSimilarity().fit(self._notes(X))        # only embeds the concept phrases
         self.feature_names_out_ = list(self._build(X.head(5)).columns)
         return self
 
@@ -290,7 +405,8 @@ class SquirrelFeatures(BaseEstimator, TransformerMixin):
 
 def make_preprocessor(keep_day_level=False, drop_hill_distance=True, log_height=True, log_distances=False,
                       use_nearest_place_kind=True, use_highlight_colors=True, min_highlight_count=10,
-                      use_keyword_similarity=False, scaler="standard", impute_strategy="median", min_category_count=5):
+                      use_keyword_similarity=False, use_spacy_similarity=False, scaler="standard",
+                      impute_strategy="median", min_category_count=5):
     """Full preprocessing: clean and build features, fill missing numbers, scale numbers, one-hot the categories.
 
     scaler            'standard' (mean 0, std 1), 'robust' (median and IQR, less sensitive to outliers) or 'none'
@@ -298,6 +414,7 @@ def make_preprocessor(keep_day_level=False, drop_hill_distance=True, log_height=
     min_category_count  categories seen in fewer training rows are grouped together as 'infrequent'
     use_keyword_similarity  add the keyword similarity columns (kw_*, has_note). The kw_* columns are already between
                         0 and 1, so they are not scaled
+    use_spacy_similarity  add the spaCy concept similarity columns (sem_*, has_note). Cosine similarities, not scaled
     All fitting (means, medians, categories, highlight colors) happens on the table given to `fit`.
     """
     scalers = {"standard": StandardScaler(), "robust": RobustScaler(), "none": "passthrough"}
@@ -309,7 +426,7 @@ def make_preprocessor(keep_day_level=False, drop_hill_distance=True, log_height=
     categories = OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=min_category_count,
                                sparse_output=False)
     columns = ColumnTransformer(
-        [("numbers", numbers, make_column_selector(dtype_include=np.floating, pattern=r"^(?!kw_)")),
+        [("numbers", numbers, make_column_selector(dtype_include=np.floating, pattern=r"^(?!kw_|sem_)")),
          ("categories", categories, make_column_selector(dtype_include="category"))],
         remainder="passthrough",                      # the 0/1 columns stay as they are
         verbose_feature_names_out=False)
@@ -318,6 +435,7 @@ def make_preprocessor(keep_day_level=False, drop_hill_distance=True, log_height=
         keep_day_level=keep_day_level, drop_hill_distance=drop_hill_distance,
         log_height=log_height, log_distances=log_distances,
         use_nearest_place_kind=use_nearest_place_kind, use_highlight_colors=use_highlight_colors,
-        min_highlight_count=min_highlight_count, use_keyword_similarity=use_keyword_similarity)),
+        min_highlight_count=min_highlight_count, use_keyword_similarity=use_keyword_similarity,
+        use_spacy_similarity=use_spacy_similarity)),
         ("columns", columns)])
     return pipe.set_output(transform="pandas")
