@@ -183,11 +183,11 @@ def texts_to_vectors(texts, exclude_stop=True, exclude_punct=True):
     """
     texts = pd.Series(texts).astype("string").fillna("").tolist()
     key = (exclude_stop, exclude_punct)
-    todo = list(dict.fromkeys(t for t in texts if (t, key) not in _VECTOR_CACHE))
-    if todo:
+    new_texts = list(dict.fromkeys(t for t in texts if (t, key) not in _VECTOR_CACHE))
+    if new_texts:
         nlp = get_nlp()
         size = nlp.vocab.vectors_length
-        for text, doc in zip(todo, nlp.pipe(todo)):
+        for text, doc in zip(new_texts, nlp.pipe(new_texts)):
             tokens = [t.vector for t in doc if t.has_vector and not t.is_space
                       and not (exclude_stop and t.is_stop) and not (exclude_punct and t.is_punct)]
             _VECTOR_CACHE[(text, key)] = (np.mean(tokens, axis=0) if tokens else np.zeros(size)).astype(np.float32)
@@ -244,6 +244,69 @@ class SpacyConceptSimilarity(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, "feature_names_out_")
         return np.array(self.feature_names_out_, dtype=object)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Searching the reports with plain words (for people, not a model feature)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def describe_sightings(sightings):
+    """One plain-English sentence per sighting, built from its columns, e.g.
+    'Adult Cinnamon squirrel with White highlights. Above Ground, 10 ft up. PM. Seen: climbing, approaches.
+     Notes: nut in mouth. Place: near tree by the path. Near The Pond (Lake).'
+    Used to search the reports with words, and easy for an agent to read."""
+    X = sightings
+    def col(name):
+        return X[name].astype("string").fillna("") if name in X else pd.Series("", index=X.index, dtype="string")
+    age = col("Age").where(col("Age").isin(["Adult", "Juvenile"]), "")
+    fur = col("Primary Fur Color")
+    text = (age + " " + fur + " squirrel").str.strip()
+    highlight = col("Highlight Fur Color").str.replace(",", " and", regex=False)
+    text = text + highlight.where(highlight == "", " with " + highlight + " highlights") + "."
+    height = pd.to_numeric(col("Above Ground Sighter Measurement"), errors="coerce")
+    where = col("Location") + height.map(lambda h: f", {h:g} ft up" if pd.notna(h) and h > 0 else "").astype("string")
+    text = text + where.where(where == "", " " + where + ".") + col("Shift").where(col("Shift") == "", " " + col("Shift") + ".")
+    seen = pd.Series([[b.lower() for b in BEHAVIORS if b in X and bool(X.at[i, b]) is True] for i in X.index], index=X.index)
+    text = text + seen.map(lambda bs: f" Seen: {', '.join(bs)}." if bs else "").astype("string")
+    notes = KeywordSimilarity.clean(SquirrelFeatures._notes(X)) if all(c in X for c in TEXT_COLUMNS) else pd.Series("", index=X.index)
+    text = text + notes.map(lambda n: f" Notes: {n}." if n else "").astype("string")
+    place = col("Specific Location").str.strip()
+    text = text + place.where(place == "", " Place: " + place + ".")
+    near = col("geo_nearest_place").str.replace(r", New York County, NY$", "", regex=True)
+    text = text + (" Near " + near + ".").where(~near.isin(["", "none"]), "")
+    return text.str.replace(r"\s+", " ", regex=True).str.strip()
+
+
+def search_sightings(sightings, query, top=10, exclude_stop=True):
+    """Find the sightings that best match a plain-language query, e.g. 'black squirrel approaching people near the pond'.
+
+    Two scores are combined, like the two text methods of the Preparation notebook:
+      words_matched  share of the query's word stems found in the sighting's description (exact matches)
+      similarity     cosine similarity of the spaCy vectors of the query and the description (matches by meaning)
+      phrases_matched  share of the query's neighbouring word pairs found next to each other ("black squirrel")
+    Results are sorted by words_matched + phrases_matched, then by similarity. The label is never used to rank.
+    Returns the best `top` sightings with their description (and `geo_where_text` / `diseased` when present).
+    """
+    described = describe_sightings(sightings)
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+    ignore = {stem(w) for w in ENGLISH_STOP_WORDS | {"squirrel", "squirrels"}}      # every description has these
+    query_words = [w for w in stems(query.lower()) if w not in ignore or w.startswith("squirrel")]
+    query_stems = set(query_words) - ignore
+    # Pairs of neighbouring query words ("cinnamon squirrel", "approach people"), so that "cinnamon squirrel" ranks a
+    # cinnamon squirrel above a gray squirrel with cinnamon highlights
+    query_pairs = set(zip(query_words, query_words[1:]))
+    desc_words = described.str.lower().map(lambda d: [w for w in stems(d) if w not in ignore or w.startswith("squirrel")])
+    found = desc_words.map(lambda ws: len(query_stems & set(ws)) / max(len(query_stems), 1))
+    pairs = desc_words.map(lambda ws: len(query_pairs & set(zip(ws, ws[1:]))) / max(len(query_pairs), 1))
+    sims = (_unit(texts_to_vectors(described, exclude_stop=exclude_stop))
+            @ _unit(texts_to_vectors([query], exclude_stop=exclude_stop)).T).ravel()
+    out = pd.DataFrame({"words_matched": found.round(2), "phrases_matched": pairs.round(2), "similarity": sims.round(3),
+                        "description": described}, index=sightings.index)
+    for extra in ["date", "geo_where_text", "diseased"]:
+        if extra in sightings:
+            out[extra] = sightings[extra]
+    out["_rank"] = out["words_matched"] + out["phrases_matched"]
+    return out.sort_values(["_rank", "similarity"], ascending=False).drop(columns="_rank").head(top)
 
 
 class SquirrelFeatures(BaseEstimator, TransformerMixin):
@@ -439,3 +502,12 @@ def make_preprocessor(keep_day_level=False, drop_hill_distance=True, log_height=
         use_spacy_similarity=use_spacy_similarity)),
         ("columns", columns)])
     return pipe.set_output(transform="pandas")
+
+# Preparation settings chosen by the tuned ensemble in the Training notebook (section 9, random search on the training set).
+# The Preparation notebook builds `preprocessor.pkl` from them, so it matches the first step of `model.pkl`.
+TUNED_SETTINGS = {
+    "keep_day_level": False, "drop_hill_distance": True, "log_height": True, "log_distances": True,
+    "use_nearest_place_kind": True, "use_highlight_colors": False, "min_highlight_count": 46,
+    "use_keyword_similarity": True, "use_spacy_similarity": True,
+    "scaler": "none", "impute_strategy": "median", "min_category_count": 14,
+}
